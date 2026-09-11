@@ -1,0 +1,12 @@
+{
+  "name": "max-bot",
+  "version": "1.0.0",
+  "type": "module",
+  "dependencies": {
+    "@maxhub/max-bot-api": "^0.3.1",
+    "better-sqlite3": "^13.0.3",
+    "dotenv": "^17.4.2",
+    "sqlite": "^5.1.1",
+    "sqlite3": "^6.0.1"
+  }
+}

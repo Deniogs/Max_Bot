@@ -1,0 +1,18 @@
+{
+  "individuals": {
+    "price": 1416.47,
+    "min_order": 2834.94,
+    "km_order": 93.57,
+    "wait_order": 1416.47,
+    "loader_standard": 650.86,
+    "loader_hard": 976.29
+  },
+  "legal": {
+    "price": 1525.43,
+    "min_order": 3050.86,
+    "km_order": 100.77,
+    "wait_order": 1525.43,
+    "loader_standard": 650.86,
+    "loader_hard": 976.29
+  }
+}
