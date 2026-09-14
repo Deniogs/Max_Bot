@@ -5,12 +5,12 @@
 //   ██████╗██║  ██║███████╗██║  ██║   ██║   ███████╗██████╔╝    ██████╔╝    ██║   
 //   ╚═════╝╚═╝  ╚═╝╚══════╝╚═╝  ╚═╝   ╚═╝   ╚══════╝╚═════╝     ╚═════╝     ╚═╝   
 //
-//  ██████╗ ███████╗███╗   ██╗██╗ █████╗ ██╗ ▄█████╗
-//  ██╔══██╗██╔════╝████╗  ██║██║██╔══██╗██║██╔════╝
-//  ██║  ██║█████╗  ██╔██╗ ██║██║██║  ██║██║██║  ███╗
-//  ██║  ██║██╔══╝  ██║╚██╗██║██║██║  ██║██║██║   ██║
-//  ██████╔╝███████╗██║ ╚████║██║ █████╔╝██║╚██████╔╝
-//  ╚═════╝ ╚══════╝╚═╝  ╚═══╝╚═╝ ╚════╝ ╚═╝ ╚═════╝
+//  ██████╗ ███████╗███╗   ██╗██╗ █████╗  ▄█████╗
+//  ██╔══██╗██╔════╝████╗  ██║██║██╔══██╗██╔════╝
+//  ██║  ██║█████╗  ██╔██╗ ██║██║██║  ██║██║  ███╗
+//  ██║  ██║██╔══╝  ██║╚██╗██║██║██║  ██║██║   ██║
+//  ██████╔╝███████╗██║ ╚████║██║ █████╔╝╚██████╔╝
+//  ╚═════╝ ╚══════╝╚═╝  ╚═══╝╚═╝ ╚════╝  ╚═════╝
 // Это бот логистического центра ГУП "Почта Таврии"
 //
 // ---------------------------------------------------------------------------
@@ -38,7 +38,7 @@ import { getUserStatus, markVerified, registerFailedAttempt } from './db.js';
 
 const bot = new Bot(process.env.BOT_TOKEN);
 const ADMIN_CHAT_ID = Number(process.env.ADMIN_CHAT_ID);
-const userSessions = {};
+const userSessions = {}; 
 
 // Тут храним ТОЛЬКО номер правильного ответа для текущей капчи, пока
 // пользователь не ответил. Это не БД: если бот перезапустится в момент,
@@ -120,7 +120,7 @@ async function getTariffs(client) {
   const clientName = (client === 'legal') ? 'юридических' : 'физических';
 
   const text = `🚚 *Тарифы для ${clientName} лиц:*\n\n` +
-               `    *Почасовая тарификация (по г. Мелитополю району в радиусе 10-15 км.)*\n`
+               `    *Почасовая тарификация (по г. Мелитополю району в радиусе 10-15 км.)*\n` +
                `• Почасовая аренда авто — *${price} ₽/час*\n` +
                `• Минимальный заказ (автомобиль 2 часа) — *${min_order} ₽/час*\n\n` +
                `  *Покилометровая аренда автомобиля (от 100 км.)*\n` +
@@ -296,6 +296,7 @@ const tariffsKeyboard = Keyboard.inlineKeyboard([
     Keyboard.button.callback('Физлица', 'tariffs_individuals'),
     Keyboard.button.callback('Юрлица', 'tariffs_legal')
   ],
+  [Keyboard.button.callback('Посмотреть тарифы', 'tariffs_imamge')],
   [Keyboard.button.callback('◀ Назад в главное меню', 'main_menu')]
 ]);
 
@@ -421,6 +422,35 @@ const FAQ_ANSWERS = {
 // (после этажного уточнения и без него), поэтому вынесен в константу.
 const ORDER_DETAILS_PROMPT = 'Укажите детали заказа (пароль от подъезда, запасной контактный номер, хрупкий груз и т.д.):';
 
+// Показывается при оформлении заказа: какая сейчас тарификация и в каких
+// населённых пунктах работаем. На данный момент — покилометровая, зона —
+// г. Мелитополь и Мелитопольский округ.
+const SERVICE_AREA_NOTICE =
+  'ℹ️ *Тарификация: покилометровая.*\n' +
+  'На данный момент мы работаем по г. Мелитополь и Мелитопольскому округу. ' +
+  'При расширении зоны оказания услуг будет сообщено отдельно.\n\n';
+
+// Проверка ссылок — действует на ЛЮБОЙ текстовый шаг анкеты (см. использование
+// в bot.on('message_created')), чтобы в заявку нельзя было протащить ссылку
+// ни через одно поле (ФИО, адрес, детали заказа и т.д.).
+const LINK_PATTERN = /(https?:\/\/|www\.|t\.me\/|vk\.com\/|\b[a-zа-я0-9-]+\.(ru|com|net|org|info|io|me|su|ua|by|xyz|рф)\b)/i;
+
+function containsLink(text) {
+  return LINK_PATTERN.test(text);
+}
+
+// Проверка российского номера телефона: код страны только +7/8/7,
+// и ровно 10 цифр после него — отсекает и другие коды стран, и
+// неправильное количество цифр (больше или меньше).
+function validatePhone(text) {
+  const digitsOnly = text.trim().replace(/[^\d+]/g, '');
+  const isValid = /^(\+7|8|7)\d{10}$/.test(digitsOnly);
+
+  return isValid
+    ? true
+    : '❌ Введите корректный номер телефона в формате +7XXXXXXXXXX или 8XXXXXXXXXX (ровно 10 цифр после кода страны, принимаются только российские номера).';
+}
+
 const TEXT_STEPS = {
   // Шаг про этаж теперь идёт ПОСЛЕ веса/объёма груза (см. WAIT_WEIGHT.after),
   // а не сразу после выбора услуги.
@@ -452,11 +482,17 @@ const TEXT_STEPS = {
   // --- Общий шаг для всех: у физлиц это ФИО отправителя, у юрлиц — ФИО контактного лица ---
   WAIT_NAME: {
     save: 'name',
+    next: 'WAIT_PHONE',
+    prompt: 'Введите номер телефона отправителя (в формате +7XXXXXXXXXX или 8XXXXXXXXXX):',
+    keyboard: () => backToMenuKeyboard
+  },
+  WAIT_PHONE: {
+    save: 'phone',
+    validate: validatePhone,
     next: 'WAIT_DATE',
     prompt: 'Укажите желаемую дату и время погрузки',
     keyboard: () => backToMenuKeyboard
   },
-  //Сюда телефон
   WAIT_DATE: {
     save: 'date',
     next: 'WAIT_ADRESS',
@@ -481,12 +517,8 @@ const TEXT_STEPS = {
   },
   WAIT_ADRESS_INTERMEDIATE: {
     save: 'intermediateAdress',
-    next: 'WAIT_PHONE',
-    prompt: 'Теперь введите номер телефона отправителя для связи с менеджером:',
-    keyboard: () => backToMenuKeyboard
-  },
-  WAIT_PHONE: {
-    save: 'phone',
+    // Телефон отправителя теперь спрашивается сразу после ФИО (см. WAIT_NAME
+    // выше), поэтому здесь сразу переходим к вопросу про получателя.
     after: async (ctx, session) => {
       session.step = '';
       await ctx.reply(
@@ -503,6 +535,7 @@ const TEXT_STEPS = {
   },
   WAIT_CONSIGNEE_PHONE: {
     save: 'consigneephone',
+    validate: validatePhone,
     next: 'WAIT_WEIGHT',
     prompt: 'Ориентировочный вес/объем груза (например, "200 кг, 3 коробки"):',
     keyboard: () => backToMenuKeyboard
@@ -686,6 +719,27 @@ bot.on('message_created', async (ctx) => {
   const stepConfig = TEXT_STEPS[session.step];
   if (!stepConfig) return; // неизвестный/пустой шаг — просто игнорируем сообщение
 
+  // Клавиатура текущего шага — нужна и для обычного prompt, и для
+  // повторного показа при ошибке валидации/ссылке.
+  const currentKeyboard = stepConfig.keyboard ? stepConfig.keyboard() : backToMenuKeyboard;
+
+  // Запрет на ссылки действует на любое текстовое поле анкеты.
+  if (containsLink(text)) {
+    await ctx.reply(
+      '❌ Ссылки в заявке использовать нельзя. Перепишите сообщение без ссылок.',
+      { attachments: [currentKeyboard], format: 'markdown' }
+    );
+    return;
+  }
+
+  if (stepConfig.validate) {
+    const validation = stepConfig.validate(text);
+    if (validation !== true) {
+      await ctx.reply(validation, { attachments: [currentKeyboard], format: 'markdown' });
+      return;
+    }
+  }
+
   session.data[stepConfig.save] = text;
 
   if (stepConfig.after) {
@@ -780,6 +834,7 @@ bot.action('create_order', async (ctx) => {
 
     await navigateTo(
       ctx,
+      SERVICE_AREA_NOTICE +
       `Здравствуйте, ${fullName}!\n\n` +
       `Укажите тип вашего контрагента для оформления заявки:`,
       counterpartyKeyboard
@@ -790,6 +845,7 @@ bot.action('create_order', async (ctx) => {
   session.step = 'SELECT_TYPE';
   await navigateTo(
     ctx,
+    SERVICE_AREA_NOTICE +
     `Контрагент: ${session.data.counterparty}\n\n📦 Теперь выберите тип услуги:`,
     serviceTypeKeyboard
   );
@@ -912,12 +968,12 @@ bot.action('intermediate_no_adress', async (ctx) => {
   if (!session) return;
 
   session.data.intermediateAdress = '—';
-  session.step = 'WAIT_PHONE';
+  session.step = '';
 
   await navigateTo(
     ctx,
-    'Введите номер телефона отправителя',
-    backToMenuKeyboard
+    'Грузополучатель и Грузоотправитель одно лицо?',
+    consigneeKeyboard
   );
 });
 
@@ -955,6 +1011,15 @@ bot.action('consignee_no_consignor', async (ctx) => {
     backToMenuKeyboard
   );
 });
+
+//tariffs.jfif
+
+bot.action('tariffs_imamge', async (ctx) =>{
+  const image = await ctx.api.uploadImage({ source: '/Images/tariffs.jfif' });
+  await ctx.reply('Актуальные тарифы', {
+    attachments: [backToMenuKeyboard, image.toJson()],
+  });
+})
 
 bot.action('skip_photo', async (ctx) => {
   const { userId } = getUserData(ctx);
