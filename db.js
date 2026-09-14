@@ -1,8 +1,9 @@
-// Слой работы с БД (SQLite через better-sqlite3).
-// Тут храним только одно: прошёл ли пользователь капчу и не забанен ли он.
-// Именно ради этого файла нужна БД — чтобы при перезапуске бота
-// (pm2 restart, падение процесса и т.д.) все, кто уже прошёл проверку,
-// не должны были проходить её заново.
+// Слой работы с БД (SQLite через better-sqlite3). Три вещи:
+//  1. Прошёл ли пользователь капчу и не забанен ли он (таблица users).
+//  2. Незавершённая анкета заказа — чтобы пережить перезапуск бота
+//     (таблица sessions).
+//  3. Журнал отправленных заявок — чтобы считать лимит "не больше 3 в день"
+//     (таблица order_log).
 //
 // Установка: npm install better-sqlite3
 
@@ -23,7 +24,23 @@ db.exec(`
     banned_until  INTEGER,
     permanent_ban INTEGER NOT NULL DEFAULT 0,
     updated_at    INTEGER NOT NULL
-  )
+  );
+
+  CREATE TABLE IF NOT EXISTS sessions (
+    user_id    INTEGER PRIMARY KEY,
+    step       TEXT,
+    data       TEXT NOT NULL,
+    updated_at INTEGER NOT NULL
+  );
+
+  CREATE TABLE IF NOT EXISTS order_log (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id    INTEGER NOT NULL,
+    created_at INTEGER NOT NULL
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_order_log_user_created
+    ON order_log(user_id, created_at);
 `);
 
 const selectStmt = db.prepare('SELECT * FROM users WHERE user_id = ?');
@@ -105,3 +122,93 @@ export function registerFailedAttempt(userId) {
 }
 
 export default db;
+
+// --- СЕССИИ АНКЕТЫ (переживают перезапуск бота) ---
+
+const selectSessionStmt = db.prepare('SELECT * FROM sessions WHERE user_id = ?');
+
+const upsertSessionStmt = db.prepare(`
+  INSERT INTO sessions (user_id, step, data, updated_at)
+  VALUES (@userId, @step, @data, @updatedAt)
+  ON CONFLICT(user_id) DO UPDATE SET
+    step       = excluded.step,
+    data       = excluded.data,
+    updated_at = excluded.updated_at
+`);
+
+const deleteSessionStmt = db.prepare('DELETE FROM sessions WHERE user_id = ?');
+
+const selectAllSessionsStmt = db.prepare('SELECT * FROM sessions');
+
+// Сохраняет (или перезаписывает) текущее состояние анкеты пользователя.
+export function saveSession(userId, session) {
+  upsertSessionStmt.run({
+    userId,
+    step: session.step ?? '',
+    data: JSON.stringify(session.data ?? {}),
+    updatedAt: Date.now()
+  });
+}
+
+// Удаляет сессию — вызывается, когда анкета завершена/сброшена
+// (заказ отправлен, нажали "Главное меню", ввели /start и т.д.).
+export function deleteSession(userId) {
+  deleteSessionStmt.run(userId);
+}
+
+// Отдаёт одну сессию — не используется в горячем пути бота (там всё
+// живёт в памяти), но пригодится для отладки.
+export function loadSession(userId) {
+  const row = selectSessionStmt.get(userId);
+  if (!row) return null;
+
+  try {
+    return { step: row.step || '', data: JSON.parse(row.data) };
+  } catch (e) {
+    console.error('Повреждённая сессия в БД для userId', userId, e.message);
+    return null;
+  }
+}
+
+// Загружает ВСЕ сохранённые сессии сразу — вызывается один раз при
+// старте бота, чтобы восстановить userSessions после перезапуска.
+export function loadAllSessions() {
+  const rows = selectAllSessionsStmt.all();
+  const sessions = {};
+
+  for (const row of rows) {
+    try {
+      sessions[row.user_id] = { step: row.step || '', data: JSON.parse(row.data) };
+    } catch (e) {
+      // Одна битая запись не должна мешать восстановлению остальных
+      console.error('Пропускаю повреждённую сессию для userId', row.user_id, e.message);
+    }
+  }
+
+  return sessions;
+}
+
+// --- ЛИМИТ ЗАЯВОК (не больше 3 в день на пользователя) ---
+
+const insertOrderStmt = db.prepare('INSERT INTO order_log (user_id, created_at) VALUES (?, ?)');
+const countOrdersTodayStmt = db.prepare(
+  'SELECT COUNT(*) AS count FROM order_log WHERE user_id = ? AND created_at >= ?'
+);
+
+// Начало текущих суток по локальному времени сервера.
+function startOfToday() {
+  const d = new Date();
+  d.setHours(0, 0, 0, 0);
+  return d.getTime();
+}
+
+// Сколько заявок пользователь уже успешно отправил сегодня.
+export function countOrdersToday(userId) {
+  return countOrdersTodayStmt.get(userId, startOfToday()).count;
+}
+
+// Фиксирует факт отправки заявки — вызывать ТОЛЬКО после успешной
+// доставки сообщения в чат с заявками (см. finishOrder в bot.js).
+export function logOrder(userId) {
+  insertOrderStmt.run(userId, Date.now());
+}
