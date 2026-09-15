@@ -37,11 +37,73 @@ import { buildCaptchaChallenge } from './captcha.js';
 import {
   getUserStatus, markVerified, registerFailedAttempt,
   saveSession, deleteSession, loadAllSessions,
-  countOrdersToday, logOrder
+  countOrdersToday, logOrder, getUserOrders,
+  getOrderById, updateOrderStatus, getActiveOrders
 } from './db.js';
 
 const bot = new Bot(process.env.BOT_TOKEN);
 const ADMIN_CHAT_ID = Number(process.env.ADMIN_CHAT_ID);
+
+// ПОВТОР ПРИ ВРЕМЕННОМ СБОЕ СЕТИ. Ошибка вида
+// "ConnectTimeoutError: platform-api2.max.ru" — это не баг бота, а
+// временная недоступность API площадки. Раньше такая ошибка просто
+// улетала в bot.catch() и сообщение терялось без каких-либо попыток
+// повторить отправку. Патчим bot.api.sendMessageToChat один раз здесь —
+// этим методом под капотом пользуется и ctx.reply() (внутри библиотеки),
+// и наша прямая отправка заявки админам, так что ретраи разом
+// применяются ко всем ~17 местам, где бот шлёт сообщения.
+const MAX_SEND_RETRIES = 3;
+const RETRY_DELAY_MS = 1000;
+
+// Отличаем временный сетевой сбой (таймаут соединения, обрыв, DNS и т.п.)
+// от настоящей ошибки запроса (неверные данные, доступ запрещён и т.д.) —
+// повторять имеет смысл только первое.
+function isRetryableError(err) {
+  const code = err?.cause?.code || err?.code;
+  const retryableCodes = [
+    'UND_ERR_CONNECT_TIMEOUT', 'UND_ERR_SOCKET', 'UND_ERR_HEADERS_TIMEOUT',
+    'ECONNRESET', 'ETIMEDOUT', 'ENOTFOUND', 'ECONNREFUSED', 'EAI_AGAIN'
+  ];
+
+  if (code && retryableCodes.includes(code)) return true;
+  if (err?.message === 'fetch failed') return true; // именно так undici заворачивает сетевые сбои
+
+  return false;
+}
+
+function delay(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function withRetry(fn, description) {
+  let lastError;
+
+  for (let attempt = 1; attempt <= MAX_SEND_RETRIES; attempt++) {
+    try {
+      return await fn();
+    } catch (err) {
+      lastError = err;
+
+      if (!isRetryableError(err) || attempt === MAX_SEND_RETRIES) {
+        throw err;
+      }
+
+      console.error(
+        `⚠️ ${description}: временный сбой сети (попытка ${attempt}/${MAX_SEND_RETRIES}), повтор через ${RETRY_DELAY_MS * attempt}мс:`,
+        err.message || err
+      );
+      await delay(RETRY_DELAY_MS * attempt); // растущая пауза между попытками
+    }
+  }
+
+  throw lastError;
+}
+
+const rawSendMessageToChat = bot.api.sendMessageToChat.bind(bot.api);
+bot.api.sendMessageToChat = (...args) => withRetry(
+  () => rawSendMessageToChat(...args),
+  'Отправка сообщения'
+);
 
 // Незавершённые анкеты, сохранённые в БД до прошлого перезапуска,
 // подхватываем сразу при старте — пользователь продолжит с того же шага,
@@ -55,8 +117,69 @@ const userSessions = loadAllSessions();
 // обязательно должен пережить перезапуск (он в db.js).
 const captchaState = {};
 
-// ГЛОБАЛЬНАЯ ПЕРСИСТЕНТНОСТЬ СЕССИЙ. Регистрируется первой (до капча-гейта
-// и всех остальных обработчиков), а логика сохранения стоит ПОСЛЕ `await next()` —
+// ЗАЩИТА ОТ ДУБЛЕЙ. Две разные причины дублей — две разные проверки:
+//  1. Совпадающий по времени повторный апдейт (двойной тап, пока бот
+//     "думает") — ловит processingUsers.
+//  2. Повторная ДОСТАВКА одного и того же сообщения/нажатия — платформа
+//     или клиент при нестабильной сети иногда присылают апдейт дважды,
+//     уже НЕ одновременно, а через секунду-другую. Такое processingUsers
+//     не поймает (первый апдейт уже отпустил лок к моменту прихода
+//     второго), поэтому дополнительно сверяем уникальный id сообщения
+//     (mid) или нажатия (callback_id) — если такой уже обрабатывали
+//     недавно для этого пользователя, второй раз просто игнорируем.
+// Регистрируется САМОЙ ПЕРВОЙ, чтобы дубль отсекался до вообще любой
+// обработки (включая сохранение сессии в БД чуть ниже).
+const processingUsers = new Set();
+
+const recentUpdateIds = new Map(); // ключ "userId:id" -> время обработки
+const DEDUPE_WINDOW_MS = 2 * 60 * 1000; // с запасом — повторная доставка обычно приходит в течение секунд
+
+// Уникальный id конкретного сообщения или нажатия кнопки, если он есть.
+function getUpdateId(ctx) {
+  return ctx.message?.body?.mid || ctx.callback?.callback_id || null;
+}
+
+function isDuplicateUpdate(userId, updateId) {
+  if (!updateId) return false; // нечем сверять — не дедуплицируем вслепую
+
+  const key = `${userId}:${updateId}`;
+  const now = Date.now();
+
+  // Заодно чистим устаревшие записи, чтобы Map не рос бесконечно
+  for (const [k, ts] of recentUpdateIds) {
+    if (now - ts > DEDUPE_WINDOW_MS) recentUpdateIds.delete(k);
+  }
+
+  if (recentUpdateIds.has(key)) return true;
+
+  recentUpdateIds.set(key, now);
+  return false;
+}
+
+bot.use(async (ctx, next) => {
+  const { userId } = getUserData(ctx);
+  if (!userId) return next();
+
+  if (isDuplicateUpdate(userId, getUpdateId(ctx))) {
+    // Точно повторная доставка того же самого сообщения/нажатия — игнор.
+    return;
+  }
+
+  if (processingUsers.has(userId)) {
+    // Предыдущий апдейт этого пользователя ещё в работе — игнорируем.
+    return;
+  }
+
+  processingUsers.add(userId);
+  try {
+    await next();
+  } finally {
+    processingUsers.delete(userId);
+  }
+});
+
+// ГЛОБАЛЬНАЯ ПЕРСИСТЕНТНОСТЬ СЕССИЙ. Регистрируется до капча-гейта
+// и всех остальных обработчиков, а логика сохранения стоит ПОСЛЕ `await next()` —
 // то есть выполняется уже после того, как весь остальной бот отработал апдейт.
 // Это тот же приём "onion"-мидлвара, на котором построен собственный session()
 // в этой библиотеке (см. node_modules/@maxhub/max-bot-api/dist/session) — здесь
@@ -151,14 +274,14 @@ async function getTariffs(client) {
   const clientName = (client === 'legal') ? 'юридических' : 'физических';
 
   const text = `🚚 **Тарифы для ${clientName} лиц:**\n\n` +
-               `    **Почасовая тарификация (по г. Мелитополю району в радиусе 10-15 км.)**\n` +
+               `**Почасовая тарификация (по г. Мелитополю району в радиусе 10-15 км.)**\n` +
                `• Почасовая аренда авто — **${price} ₽/час**\n` +
                `• Минимальный заказ (автомобиль 2 часа) — **${min_order} ₽/час**\n\n` +
-               `  *Покилометровая аренда автомобиля (от 100 км.)*\n` +
+               `  **Покилометровая аренда автомобиля (от 100 км.)**\n` +
                `• Стоимость за 1 км — **${km_order} ₽/час**\n` +
                `• Простой при тарифе за км — **${wait_order} ₽/час**\n\n` +
                `📦 **Услуги грузчиков**\n` +
-               `• Грузчик стандарт — **${loader_standard} ₽/час\n**` +
+               `• Грузчик стандарт — **${loader_standard} ₽/час**\n` +
                `• ПРР повышеной сложности — **${loader_hard} ₽/час**`;
 
   return text;
@@ -201,21 +324,22 @@ async function goToNameStep(ctx, session, prefix = '') {
 }
 
 // Формируем и отправляем администратору финальную заявку, затем чистим сессию
-async function finishOrder(ctx, session, userId) {
+// Собирает текст с деталями заказа из session.data — используется и для
+// сообщения админам, и для экрана "проверьте заявку" перед отправкой,
+// чтобы не дублировать форматирование в двух местах.
+function buildOrderDetailsText(data) {
   const {
     name, consigneename, counterparty, service, floor, floorItems, phone,
     consigneephone, date, adress, intermediateAdress, details,
-    adressUnload, weight, orgName, inn, payment, photoToken
-  } = session.data;
+    adressUnload, weight, orgName, inn, payment
+  } = data;
 
-  // Строки про организацию показываем в заявке только если это юрлицо
   const orgLines = orgName
     ? `🏢 Организация: ${orgName}\n` +
       `🧾 ИНН: ${inn || 'Не указан'}\n`
     : '';
 
-  const adminMessage =
-    `🚨 НОВАЯ ЗАЯВКА НА ПЕРЕВОЗКУ\n\n` +
+  return (
     `📌 Контрагент: ${counterparty || 'Не указан'}\n` +
     orgLines +
     `🛠️ Тип услуги: ${service || 'Не указан'}\n` +
@@ -229,15 +353,76 @@ async function finishOrder(ctx, session, userId) {
     `🏠 Адрес выгрузки: ${adressUnload}\n` +
     `📞 Телефон отправителя: ${phone}\n` +
     `📞 Телефон получателя: ${consigneephone}\n` +
-    `⚖️ Вес/объем груза: ${weight || 'Не указан'}\n` +
+    `📦 Наименование груза, вес/объем: ${weight || 'Не указан'}\n` +
     `💳 Оплата: ${payment || 'Безналичный расчет (юрлицо)'}\n` +
-    `📦 Детали заказа:\n${details}`;
+    `📦 Детали заказа:\n${details}`
+  );
+}
+
+// Дата отправки заявки (created_at в БД) — для "Мои заказы" и /orders.
+// Это ОТДЕЛЬНАЯ дата от той, что пользователь вписал как "дату погрузки".
+function formatSubmittedAt(timestampMs) {
+  return new Date(timestampMs).toLocaleString('ru-RU', {
+    day: '2-digit', month: '2-digit', year: 'numeric', hour: '2-digit', minute: '2-digit'
+  });
+}
+
+// Достаёт КАЛЕНДАРНЫЙ день погрузки из поля вида "20.09.2026 14:30"
+// (формат гарантирован validateDate на шаге WAIT_DATE). timestamp — полночь
+// этого дня, чтобы даты можно было сравнивать и сортировать как числа;
+// label — то, что показываем на кнопке/в заголовке.
+function getOrderDateInfo(dateText) {
+  const match = (dateText || '').match(/^(\d{2})\.(\d{2})\.(\d{4})/);
+  if (!match) return null;
+
+  const [, day, month, year] = match;
+  const timestamp = new Date(Number(year), Number(month) - 1, Number(day)).getTime();
+
+  return { timestamp, label: `${day}.${month}.${year}` };
+}
+
+// Читаемая подпись статуса заказа — используется и в карточке, и в текстах
+// после смены статуса.
+const ORDER_STATUS_LABELS = {
+  active: '🟢 Активна',
+  cancelled: '🚫 Отменена',
+  closed: '✅ Закрыта'
+};
+
+// Карточка одного заказа — используется и в "Мои заказы" (у пользователя),
+// и в /orders (у админов). Короткая выжимка, а не вся анкета целиком (её
+// и так уже отправляли в чат с заявками в момент подачи).
+function buildOrderCardText(order) {
+  const d = order.data || {};
+  const submittedAt = formatSubmittedAt(order.createdAt);
+  const statusLabel = ORDER_STATUS_LABELS[order.status] || order.status;
+
+  return (
+    `**Заявка №${order.id}** — ${statusLabel}\n` +
+    `Подана: ${submittedAt}\n` +
+    `Телефон: ${d.phone || '—'}\n` +
+    `Услуга: ${d.service || '—'}\n` +
+    `Погрузка: ${d.date || '—'}, ${d.adress || '—'}\n` +
+    `Выгрузка: ${d.adressUnload || '—'}`
+  );
+}
+
+function adminOrderKeyboard(orderId) {
+  return Keyboard.inlineKeyboard([
+    [
+      Keyboard.button.callback('✅ Закрыть', `admin_close_${orderId}`),
+      Keyboard.button.callback('❌ Отменить', `admin_cancel_${orderId}`)
+    ]
+  ]);
+}
+
+async function finishOrder(ctx, session, userId) {
+  const adminMessage = `🚨 НОВАЯ ЗАЯВКА НА ПЕРЕВОЗКУ\n\n${buildOrderDetailsText(session.data)}`;
 
   // Если пользователь прислал фото груза — прикрепляем его к тому же
   // сообщению в чат с заявками (по токену, без повторной загрузки файла).
-
-  const adminAttachments = photoToken
-    ? [new ImageAttachment({ token: photoToken }).toJson()]
+  const adminAttachments = session.data.photoToken
+    ? [new ImageAttachment({ token: session.data.photoToken }).toJson()]
     : [];
 
   try {
@@ -247,7 +432,12 @@ async function finishOrder(ctx, session, userId) {
 
     // Считаем в дневной лимит только реально дошедшие до менеджера заявки —
     // если отправка упала (catch ниже), она не должна съедать лимит пользователя.
-    logOrder(userId);
+    logOrder(userId, session.data);
+
+    // Сессию чистим ТОЛЬКО после подтверждённой успешной отправки — если
+    // удалить её раньше и отправка всё же провалится, заполненная анкета
+    // потеряется безвозвратно.
+    delete userSessions[userId];
 
     await ctx.reply(
       '✅ Ваша заявка принята!\n\nМенеджер уже обрабатывает данные и свяжется с вами в ближайшее время.',
@@ -255,13 +445,36 @@ async function finishOrder(ctx, session, userId) {
     );
   } catch (err) {
     console.error('🔥 Ошибка отправки админам:', err);
-    await ctx.reply(
-      '⚠️ Произошла ошибка при отправке заявки. Попробуйте позже.',
-      { attachments: [backToMenuKeyboard], format: 'markdown' }
-    );
-  }
 
-  delete userSessions[userId];
+    // Сессию НЕ трогаем — данные остаются, кнопка "Подтвердить и отправить"
+    // сработает ещё раз без повторного заполнения анкеты с нуля.
+    try {
+      await ctx.reply(
+        '⚠️ Не получилось отправить заявку из-за временного сбоя связи. ' +
+        'Ваши данные никуда не делись — нажмите «Подтвердить и отправить» ещё раз через минуту.',
+        { attachments: [confirmOrderKeyboard], format: 'markdown' }
+      );
+    } catch (replyErr) {
+      // Сеть недоступна настолько, что даже это сообщение не ушло.
+      // Ничего страшного: данные всё равно целы в сессии и в БД
+      // (персистентная мидлвара сохранит их после этого апдейта) —
+      // пользователь попробует снова, когда связь восстановится.
+      console.error('🔥 Не удалось даже уведомить пользователя о сбое:', replyErr);
+    }
+  }
+}
+
+// Экран "проверьте заявку" перед отправкой — показывается вместо
+// немедленной отправки, требует явного подтверждения кнопкой.
+async function showOrderSummary(ctx, session) {
+  session.step = '';
+
+  await ctx.reply(
+    '📋 **Проверьте данные перед отправкой:**\n\n' +
+    buildOrderDetailsText(session.data) +
+    '\n\nВсё верно?',
+    { attachments: [confirmOrderKeyboard], format: 'markdown' }
+  );
 }
 
 // Куда вести пользователя дальше после того, как он прислал фото
@@ -277,7 +490,7 @@ async function proceedAfterPhoto(ctx, session, userId) {
     return;
   }
 
-  await finishOrder(ctx, session, userId);
+  await showOrderSummary(ctx, session);
 }
 
 // Обрабатывает сообщение на шаге WAIT_PHOTO: достаёт токен фото из
@@ -322,6 +535,7 @@ const backToMenuKeyboard = Keyboard.inlineKeyboard([
 const startKeyboard = Keyboard.inlineKeyboard([
   [Keyboard.button.callback('Тарифы', 'show_tariffs')],
   [Keyboard.button.callback('Рассчитать и оформить заказ', 'create_order')],
+  [Keyboard.button.callback('Мои заказы', 'my_orders')],
   [Keyboard.button.callback('Контакты', 'show_contacts')],
   [Keyboard.button.callback('Часто задаваемые вопросы', 'faq')]
 ]);
@@ -399,6 +613,13 @@ const paymentKeyboard = Keyboard.inlineKeyboard([
 // Фото груза необязательно — даём кнопку пропустить этот шаг
 const skipPhotoKeyboard = Keyboard.inlineKeyboard([
   [Keyboard.button.callback('Пропустить', 'skip_photo')]
+]);
+
+// Финальный экран проверки заявки перед отправкой. "Отмена" переиспользует
+// существующий main_menu (он и так чистит сессию и возвращает в меню).
+const confirmOrderKeyboard = Keyboard.inlineKeyboard([
+  [Keyboard.button.callback('✅ Подтвердить и отправить', 'confirm_order')],
+  [Keyboard.button.callback('❌ Отмена', 'main_menu')]
 ]);
 
 // --- ОТВЕТЫ FAQ (данные, а не код — просто добавляй новые пары id: текст) ---
@@ -485,6 +706,45 @@ function validatePhone(text) {
     : '❌ Введите корректный номер телефона в формате +7XXXXXXXXXX или 8XXXXXXXXXX (ровно 10 цифр после кода страны, принимаются только российские номера).';
 }
 
+// Проверка даты и времени погрузки: строгий формат ДД.ММ.ГГГГ ЧЧ:ММ,
+// дата должна реально существовать, и быть минимум на час позже текущего
+// момента — иначе менеджер физически не успеет обработать заявку.
+function validateDate(text) {
+  const match = text.trim().match(/^(\d{1,2})\.(\d{1,2})\.(\d{4})\s+(\d{1,2}):(\d{2})$/);
+
+  const formatHint = '❌ Укажите дату и время в формате ДД.ММ.ГГГГ ЧЧ:ММ, например: 20.09.2026 14:30';
+
+  if (!match) return formatHint;
+
+  const [, dayStr, monthStr, yearStr, hourStr, minuteStr] = match;
+  const day = Number(dayStr);
+  const month = Number(monthStr);
+  const year = Number(yearStr);
+  const hour = Number(hourStr);
+  const minute = Number(minuteStr);
+
+  const date = new Date(year, month - 1, day, hour, minute);
+
+  // new Date() сама "переносит" несуществующие даты (например, 31.02
+  // превратится в начало марта) — сверяем, что введённое совпадает
+  // с тем, что реально получилось, иначе отсекаем.
+  const isRealDate =
+    date.getFullYear() === year && date.getMonth() === month - 1 &&
+    date.getDate() === day && date.getHours() === hour && date.getMinutes() === minute;
+
+  if (!isRealDate) {
+    return '❌ Такой даты или времени не существует. Проверьте и введите ещё раз в формате ДД.ММ.ГГГГ ЧЧ:ММ.';
+  }
+
+  const minAllowed = new Date(Date.now() + 60 * 60 * 1000); // текущий момент + 1 час
+
+  if (date < minAllowed) {
+    return '❌ Дата и время погрузки должны быть минимум на час позже текущего момента. Укажите более позднее время.';
+  }
+
+  return true;
+}
+
 const TEXT_STEPS = {
   // Шаг про этаж теперь идёт ПОСЛЕ веса/объёма груза (см. WAIT_WEIGHT.after),
   // а не сразу после выбора услуги.
@@ -524,11 +784,12 @@ const TEXT_STEPS = {
     save: 'phone',
     validate: validatePhone,
     next: 'WAIT_DATE',
-    prompt: 'Укажите желаемую дату и время погрузки',
+    prompt: 'Укажите дату и время погрузки в формате ДД.ММ.ГГГГ ЧЧ:ММ (например, 20.09.2026 14:30):',
     keyboard: () => backToMenuKeyboard
   },
   WAIT_DATE: {
     save: 'date',
+    validate: validateDate,
     next: 'WAIT_ADRESS',
     prompt: 'Укажите адресс погрузки (город, улица, дом, подъезд):',
     keyboard: () => backToMenuKeyboard
@@ -571,7 +832,7 @@ const TEXT_STEPS = {
     save: 'consigneephone',
     validate: validatePhone,
     next: 'WAIT_WEIGHT',
-    prompt: 'Ориентировочный вес/объем груза (например, "200 кг, 3 коробки"):',
+    prompt: 'Наименование груза, ориентировочный вес/объем груза (например, "холодильник 100кг, 1 коробка картонная"):',
     keyboard: () => backToMenuKeyboard
   },
   WAIT_WEIGHT: {
@@ -641,6 +902,10 @@ function formatTimeLeft(untilTimestamp) {
 bot.use(async (ctx, next) => {
   const { userId } = getUserData(ctx);
   if (!userId) return next();
+
+  // Капча — это проверка клиентов, а не админ-чата. Иначе и /orders,
+  // и вообще любое действие админов упиралось бы в "докажите, что вы не бот".
+  if (ctx.chatId === ADMIN_CHAT_ID) return next();
 
   // Нажатие на саму капчу должно дойти до своего обработчика ниже,
   // иначе пользователь никогда не сможет её пройти.
@@ -724,6 +989,156 @@ bot.command('start', async (ctx) => {
     'Привет! Я бот логистического центра ГУП "Почта Таврии". Помогу  оформить заявку на грузоперевозку. Выберите, что нужно:',
     { attachments: [startKeyboard], format: 'markdown' }
   );
+});
+
+// /orders — ТОЛЬКО в чате админов. Вместо того чтобы сразу вываливать все
+// активные заявки, сначала показываем даты погрузки (на которые есть хоть
+// одна активная заявка), от ближайшей к самой поздней — начиная с сегодня.
+// Выбор конкретной даты — уже отдельным нажатием, см. orders_date_ ниже.
+bot.command('orders', async (ctx) => {
+  if (ctx.chatId !== ADMIN_CHAT_ID) {
+    // Не отвечаем вообще — не подсказываем посторонним, что такая команда есть.
+    return;
+  }
+
+  const orders = getActiveOrders(200);
+
+  if (orders.length === 0) {
+    await ctx.reply('🟢 Активных заявок нет.', { format: 'markdown' });
+    return;
+  }
+
+  // Группируем по календарному дню погрузки (не по дню подачи заявки —
+  // админу для планирования важно, на какую дату что запланировано)
+  const dateGroups = new Map(); // timestamp полуночи -> { label, count }
+
+  for (const order of orders) {
+    const info = getOrderDateInfo(order.data.date);
+    if (!info) continue; // на всякий случай, если в старых заявках дата не по формату
+
+    const existing = dateGroups.get(info.timestamp);
+    dateGroups.set(info.timestamp, { label: info.label, count: (existing?.count || 0) + 1 });
+  }
+
+  if (dateGroups.size === 0) {
+    await ctx.reply('Не удалось определить даты погрузки активных заявок.', { format: 'markdown' });
+    return;
+  }
+
+  const todayTimestamp = new Date(new Date().setHours(0, 0, 0, 0)).getTime();
+
+  const sortedTimestamps = [...dateGroups.keys()].sort((a, b) => a - b);
+
+  const buttons = sortedTimestamps.map((timestamp) => {
+    const { label, count } = dateGroups.get(timestamp);
+    const isToday = timestamp === todayTimestamp;
+    const isOverdue = timestamp < todayTimestamp;
+    const prefix = isOverdue ? '⚠️ ' : (isToday ? '▶️ Сегодня, ' : '');
+
+    return [Keyboard.button.callback(`${prefix}${label} (${count})`, `orders_date_${timestamp}`)];
+  });
+
+  await ctx.reply(
+    '📅 **Выберите дату погрузки, чтобы посмотреть активные заявки:**\n' +
+    '⚠️ — дата уже прошла, а заявка всё ещё активна.',
+    { attachments: [Keyboard.inlineKeyboard(buttons)], format: 'markdown' }
+  );
+});
+
+// Показ активных заявок на выбранную дату — каждая отдельной карточкой
+// с кнопками "Закрыть" / "Отменить".
+bot.action(/^orders_date_/, async (ctx) => {
+  if (ctx.chatId !== ADMIN_CHAT_ID) return;
+
+  const rawData = ctx.callback?.payload || ctx.update?.callback?.payload || '';
+  const targetTimestamp = Number(String(rawData).replace('orders_date_', ''));
+
+  const orders = getActiveOrders(200).filter((order) => {
+    const info = getOrderDateInfo(order.data.date);
+    return info && info.timestamp === targetTimestamp;
+  });
+
+  if (orders.length === 0) {
+    await replyAndClear(ctx, 'На эту дату активных заявок не найдено (возможно, их уже обработали).');
+    return;
+  }
+
+  const dateLabel = getOrderDateInfo(orders[0].data.date)?.label || '';
+
+  try {
+    await ctx.deleteMessage(); // убираем экран с выбором даты
+  } catch (e) {
+    // Игнорируем, если уже удалено
+  }
+
+  await ctx.reply(`📦 **Заявки на ${dateLabel} (${orders.length}):**`, { format: 'markdown' });
+
+  for (const order of orders) {
+    await ctx.reply(
+      buildOrderCardText(order),
+      { attachments: [adminOrderKeyboard(order.id)], format: 'markdown' }
+    );
+  }
+});
+
+// Админ закрывает заявку (считает выполненной) или отменяет её.
+// Обе кнопки живут только в чате админов — доп. проверка на всякий случай,
+// если payload вдруг придёт откуда-то ещё.
+bot.action(/^admin_close_/, async (ctx) => {
+  if (ctx.chatId !== ADMIN_CHAT_ID) return;
+
+  const rawData = ctx.callback?.payload || ctx.update?.callback?.payload || '';
+  const orderId = Number(String(rawData).replace('admin_close_', ''));
+  const order = getOrderById(orderId);
+
+  if (!order) {
+    await replyAndClear(ctx, 'Заявка не найдена (возможно, уже обработана).');
+    return;
+  }
+
+  updateOrderStatus(orderId, 'closed');
+
+  // Уведомляем клиента, что заявка выполнена — как и при отмене, только
+  // с другим текстом (закрыл её админ = заявка выполнена, не отменена).
+  try {
+    await bot.api.sendMessageToUser(
+      order.userId,
+      `✅ Ваша заявка №${orderId} выполнена. Спасибо, что обратились в ГУП "Почта Таврии"!`,
+      { format: 'markdown' }
+    );
+  } catch (err) {
+    console.error('Не удалось уведомить клиента о закрытии заявки админом:', err.message || err);
+  }
+
+  await replyAndClear(ctx, `✅ Заявка №${orderId} закрыта.`);
+});
+
+bot.action(/^admin_cancel_/, async (ctx) => {
+  if (ctx.chatId !== ADMIN_CHAT_ID) return;
+
+  const rawData = ctx.callback?.payload || ctx.update?.callback?.payload || '';
+  const orderId = Number(String(rawData).replace('admin_cancel_', ''));
+  const order = getOrderById(orderId);
+
+  if (!order) {
+    await replyAndClear(ctx, 'Заявка не найдена (возможно, уже обработана).');
+    return;
+  }
+
+  updateOrderStatus(orderId, 'cancelled');
+
+  // Уведомляем клиента, что его заявку отменили — чтобы он не ждал впустую.
+  try {
+    await bot.api.sendMessageToUser(
+      order.userId,
+      `⚠️ Ваша заявка №${orderId} была отменена менеджером. Если это неожиданно — свяжитесь с нами: +7 990 170 70 00.`,
+      { format: 'markdown' }
+    );
+  } catch (err) {
+    console.error('Не удалось уведомить клиента об отмене заявки админом:', err.message || err);
+  }
+
+  await replyAndClear(ctx, `❌ Заявка №${orderId} отменена.`);
 });
 
 // Это обработчик мать его строк. Ебанет? Не должно, но может.
@@ -1039,7 +1454,7 @@ bot.action('consignee_is_consignor', async (ctx) => {
     ctx,
     // Раньше здесь был текст про "промежуточные адреса" — скопированный не
     // из того места. Исправлено на вопрос, который реально ждёт WAIT_WEIGHT.
-    'Ориентировочный вес/объем груза (например, "200 кг, 3 коробки"):',
+    'Наименование груза, ориентировочный вес/объем груза (например, "холодильник 100кг, 1 коробка картонная"):',
     backToMenuKeyboard
   );
 });
@@ -1074,7 +1489,7 @@ bot.action('payment_cash', async (ctx) => {
   if (!session) return;
 
   session.data.payment = 'Наличными';
-  await finishOrder(ctx, session, userId);
+  await showOrderSummary(ctx, session);
 });
 
 bot.action('payment_cashless', async (ctx) => {
@@ -1083,7 +1498,41 @@ bot.action('payment_cashless', async (ctx) => {
   if (!session) return;
 
   session.data.payment = 'Безналичный расчет';
+  await showOrderSummary(ctx, session);
+});
+
+// Финальное подтверждение — только отсюда заявка реально уходит в чат.
+bot.action('confirm_order', async (ctx) => {
+  const { userId } = getUserData(ctx);
+  const session = await requireSession(ctx, userId);
+  if (!session) return;
+
+  // Убираем сам экран "Проверьте данные перед отправкой" — дальше уже
+  // либо "Заявка принята", либо сообщение об ошибке (см. finishOrder).
+  try {
+    await ctx.deleteMessage();
+  } catch (e) {
+    // Игнорируем, если сообщение уже удалено
+  }
+
   await finishOrder(ctx, session, userId);
+});
+
+bot.action('my_orders', async (ctx) => {
+  const { userId } = getUserData(ctx);
+  const orders = getUserOrders(userId, 10);
+
+  if (orders.length === 0) {
+    await navigateTo(ctx, 'У вас пока нет отправленных заявок.', startKeyboard);
+    return;
+  }
+
+  // Отменить или закрыть заявку самостоятельно нельзя — это делает
+  // только менеджер (см. /orders в чате админов), поэтому здесь просто
+  // список для справки, без кнопок под каждой заявкой.
+  const text = `📦 **Ваши последние заявки (${orders.length}):**\n\n${orders.map(buildOrderCardText).join('\n\n')}`;
+
+  await navigateTo(ctx, text, startKeyboard);
 });
 
 bot.action('show_contacts', async (ctx) => {

@@ -1,9 +1,9 @@
-// Слой работы с БД (SQLite через better-sqlite3). Три вещи:
+// Слой работы с БД (SQLite через better-sqlite3). Четыре вещи:
 //  1. Прошёл ли пользователь капчу и не забанен ли он (таблица users).
 //  2. Незавершённая анкета заказа — чтобы пережить перезапуск бота
 //     (таблица sessions).
-//  3. Журнал отправленных заявок — чтобы считать лимит "не больше 3 в день"
-//     (таблица order_log).
+//  3. Журнал отправленных заявок — лимит "не больше 3 в день", "Мои заказы"
+//     у пользователя и /orders в чате админов (таблица order_log).
 //
 // Установка: npm install better-sqlite3
 
@@ -36,12 +36,27 @@ db.exec(`
   CREATE TABLE IF NOT EXISTS order_log (
     id         INTEGER PRIMARY KEY AUTOINCREMENT,
     user_id    INTEGER NOT NULL,
-    created_at INTEGER NOT NULL
+    created_at INTEGER NOT NULL,
+    data       TEXT,
+    status     TEXT NOT NULL DEFAULT 'active'
   );
 
   CREATE INDEX IF NOT EXISTS idx_order_log_user_created
     ON order_log(user_id, created_at);
 `);
+
+// Миграция для БД, созданных до появления "Моих заказов"/`/orders`/статусов —
+// у них таблица order_log может быть ещё без колонок data/status.
+// CREATE TABLE IF NOT EXISTS не добавляет колонки в уже существующую
+// таблицу, поэтому проверяем и дописываем вручную, чтобы не терять
+// старую базу при обновлении бота.
+const orderLogColumns = db.prepare("PRAGMA table_info(order_log)").all().map((c) => c.name);
+if (!orderLogColumns.includes('data')) {
+  db.exec('ALTER TABLE order_log ADD COLUMN data TEXT');
+}
+if (!orderLogColumns.includes('status')) {
+  db.exec("ALTER TABLE order_log ADD COLUMN status TEXT NOT NULL DEFAULT 'active'");
+}
 
 const selectStmt = db.prepare('SELECT * FROM users WHERE user_id = ?');
 
@@ -188,12 +203,31 @@ export function loadAllSessions() {
   return sessions;
 }
 
-// --- ЛИМИТ ЗАЯВОК (не больше 3 в день на пользователя) ---
+// --- ЖУРНАЛ ЗАЯВОК: дневной лимит, статусы, "Мои заказы", /orders у админов ---
 
-const insertOrderStmt = db.prepare('INSERT INTO order_log (user_id, created_at) VALUES (?, ?)');
+const insertOrderStmt = db.prepare('INSERT INTO order_log (user_id, created_at, data) VALUES (?, ?, ?)');
+
 const countOrdersTodayStmt = db.prepare(
   'SELECT COUNT(*) AS count FROM order_log WHERE user_id = ? AND created_at >= ?'
 );
+
+const selectUserOrdersStmt = db.prepare(
+  'SELECT * FROM order_log WHERE user_id = ? ORDER BY created_at DESC LIMIT ?'
+);
+
+// Для админов — от СТАРЫХ к НОВЫМ (очередь на обработку), поэтому
+// отдельный запрос с ASC, а не просто DESC, как для "Моих заказов".
+const selectRecentOrdersAscStmt = db.prepare(
+  'SELECT * FROM order_log ORDER BY created_at ASC LIMIT ?'
+);
+const selectRecentOrdersDescStmt = db.prepare(
+  'SELECT * FROM order_log ORDER BY created_at DESC LIMIT ?'
+);
+
+const selectOrderByIdStmt = db.prepare('SELECT * FROM order_log WHERE id = ?');
+const updateOrderStatusStmt = db.prepare('UPDATE order_log SET status = ? WHERE id = ?');
+
+const countAllOrdersStmt = db.prepare('SELECT COUNT(*) AS count FROM order_log');
 
 // Начало текущих суток по локальному времени сервера.
 function startOfToday() {
@@ -202,13 +236,75 @@ function startOfToday() {
   return d.getTime();
 }
 
-// Сколько заявок пользователь уже успешно отправил сегодня.
+function parseOrderRow(row) {
+  try {
+    return {
+      id: row.id,
+      userId: row.user_id,
+      createdAt: row.created_at,
+      status: row.status || 'active',
+      data: row.data ? JSON.parse(row.data) : {}
+    };
+  } catch (e) {
+    console.error('Повреждённая запись заказа id', row.id, e.message);
+    return null;
+  }
+}
+
+// Сколько заявок пользователь уже успешно отправил сегодня. Считаются ВСЕ
+// заявки независимо от статуса — лимит про то, сколько раз в день человек
+// дошёл до подтверждения заявки, а не про то, что с ней случилось потом.
 export function countOrdersToday(userId) {
   return countOrdersTodayStmt.get(userId, startOfToday()).count;
 }
 
 // Фиксирует факт отправки заявки — вызывать ТОЛЬКО после успешной
 // доставки сообщения в чат с заявками (см. finishOrder в bot.js).
-export function logOrder(userId) {
-  insertOrderStmt.run(userId, Date.now());
+// data — это session.data целиком, чтобы потом можно было показать
+// и "Мои заказы" пользователю, и полный список /orders админам.
+// Статус новой заявки всегда 'active' (значение по умолчанию в таблице).
+export function logOrder(userId, data) {
+  insertOrderStmt.run(userId, Date.now(), JSON.stringify(data ?? {}));
+}
+
+// Заказы конкретного пользователя, самые свежие первыми — для "Мои заказы".
+export function getUserOrders(userId, limit = 10) {
+  return selectUserOrdersStmt.all(userId, limit).map(parseOrderRow).filter(Boolean);
+}
+
+// Последние заказы вообще всех пользователей — для /orders в чате админов.
+// ascending: true — от старых к новым (так админы видят очередь как надо
+// её обрабатывать, а не перевёрнуто).
+export function getRecentOrders(limit = 20, { ascending = false } = {}) {
+  const stmt = ascending ? selectRecentOrdersAscStmt : selectRecentOrdersDescStmt;
+  return stmt.all(limit).map(parseOrderRow).filter(Boolean);
+}
+
+// Только АКТИВНЫЕ заказы, от старых к новым — используется для выбора
+// даты в /orders (закрытые/отменённые в этом разборе не нужны).
+const selectActiveOrdersAscStmt = db.prepare(
+  "SELECT * FROM order_log WHERE status = 'active' ORDER BY created_at ASC LIMIT ?"
+);
+
+export function getActiveOrders(limit = 200) {
+  return selectActiveOrdersAscStmt.all(limit).map(parseOrderRow).filter(Boolean);
+}
+
+// Одна заявка по id — нужна, чтобы проверить владельца перед отменой
+// (пользователь) или просто найти заявку перед сменой статуса (админ).
+export function getOrderById(orderId) {
+  const row = selectOrderByIdStmt.get(orderId);
+  return row ? parseOrderRow(row) : null;
+}
+
+// Смена статуса: 'active' -> 'cancelled' (отменил пользователь или админ)
+// или 'active' -> 'closed' (админ отметил заявку выполненной).
+export function updateOrderStatus(orderId, status) {
+  updateOrderStatusStmt.run(status, orderId);
+}
+
+// Общее число заявок за всё время — чтобы в /orders можно было написать
+// "показаны последние 20 из 137", а не просто выгрузить необозримый список.
+export function countAllOrders() {
+  return countAllOrdersStmt.get().count;
 }
