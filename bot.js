@@ -274,7 +274,7 @@ async function getTariffs(client) {
   const clientName = (client === 'legal') ? 'юридических' : 'физических';
 
   const text = `🚚 **Тарифы для ${clientName} лиц:**\n\n` +
-               `**Почасовая тарификация (по г. Мелитополю району в радиусе 10-15 км.)**\n` +
+               `    **Почасовая тарификация (по г. Мелитополю району в радиусе 10-15 км.)**\n` +
                `• Почасовая аренда авто — **${price} ₽/час**\n` +
                `• Минимальный заказ (автомобиль 2 часа) — **${min_order} ₽/час**\n\n` +
                `  **Покилометровая аренда автомобиля (от 100 км.)**\n` +
@@ -407,6 +407,14 @@ function buildOrderCardText(order) {
   );
 }
 
+// Кнопки под карточкой активного заказа: у пользователя — только отмена,
+// у админов — закрыть (выполнена) или отменить.
+function userOrderKeyboard(orderId) {
+  return Keyboard.inlineKeyboard([
+    [Keyboard.button.callback('❌ Отменить заказ', `user_cancel_${orderId}`)]
+  ]);
+}
+
 function adminOrderKeyboard(orderId) {
   return Keyboard.inlineKeyboard([
     [
@@ -491,6 +499,16 @@ async function proceedAfterPhoto(ctx, session, userId) {
   }
 
   await showOrderSummary(ctx, session);
+}
+
+// Общее продолжение после шага "детали заказа" — вызывается и когда
+// пользователь написал текст, и когда нажал "Пропустить" (см. skip_details).
+async function proceedAfterDetails(ctx, session) {
+  session.step = 'WAIT_PHOTO';
+  await ctx.reply(
+    'Если есть фото груза — пришлите его сюда, это ускорит расчет. Либо нажмите «Пропустить».',
+    { attachments: [skipPhotoKeyboard], format: 'markdown' }
+  );
 }
 
 // Обрабатывает сообщение на шаге WAIT_PHOTO: достаёт токен фото из
@@ -615,6 +633,11 @@ const skipPhotoKeyboard = Keyboard.inlineKeyboard([
   [Keyboard.button.callback('Пропустить', 'skip_photo')]
 ]);
 
+// Детали заказа тоже не обязательны — не у всех есть что добавить
+const skipDetailsKeyboard = Keyboard.inlineKeyboard([
+  [Keyboard.button.callback('Пропустить', 'skip_details')]
+]);
+
 // Финальный экран проверки заявки перед отправкой. "Отмена" переиспользует
 // существующий main_menu (он и так чистит сессию и возвращает в меню).
 const confirmOrderKeyboard = Keyboard.inlineKeyboard([
@@ -710,7 +733,8 @@ function validatePhone(text) {
 // дата должна реально существовать, и быть минимум на час позже текущего
 // момента — иначе менеджер физически не успеет обработать заявку.
 function validateDate(text) {
-  const match = text.trim().match(/^(\d{1,2})\.(\d{1,2})\.(\d{4})\s+(\d{1,2}):(\d{2})$/);
+  // Время принимаем с разделителем ":", "-" или "." — 11:30, 11-30, 11.30
+  const match = text.trim().match(/^(\d{1,2})\.(\d{1,2})\.(\d{4})\s+(\d{1,2})[:\-.](\d{2})$/);
 
   const formatHint = '❌ Укажите дату и время в формате ДД.ММ.ГГГГ ЧЧ:ММ, например: 20.09.2026 14:30';
 
@@ -758,7 +782,7 @@ const TEXT_STEPS = {
     save: 'floorItems',
     next: 'WAIT_DETAILS',
     prompt: ORDER_DETAILS_PROMPT,
-    keyboard: () => backToMenuKeyboard
+    keyboard: () => skipDetailsKeyboard
   },
   // --- Эти два шага видят только юрлица, физлиц goToNameStep ведёт сразу на WAIT_NAME ---
   WAIT_ORG_NAME: {
@@ -849,17 +873,13 @@ const TEXT_STEPS = {
       }
 
       session.step = 'WAIT_DETAILS';
-      await ctx.reply(ORDER_DETAILS_PROMPT, { attachments: [backToMenuKeyboard], format: 'markdown' });
+      await ctx.reply(ORDER_DETAILS_PROMPT, { attachments: [skipDetailsKeyboard], format: 'markdown' });
     }
   },
   WAIT_DETAILS: {
     save: 'details',
     after: async (ctx, session) => {
-      session.step = 'WAIT_PHOTO';
-      await ctx.reply(
-        'Если есть фото груза — пришлите его сюда, это ускорит расчет. Либо нажмите «Пропустить».',
-        { attachments: [skipPhotoKeyboard], format: 'markdown' }
-      );
+      await proceedAfterDetails(ctx, session);
     }
   }
 };
@@ -981,14 +1001,27 @@ bot.action(/^captcha_/, async (ctx) => {
 
 // Обработчик комманд. Он должен стоять ПЕРЕД обработчиком строк, короче если захочется еще каких-нить комманд добавить - пихайте под старт
 
-bot.command('start', async (ctx) => {
-  const { userId } = getUserData(ctx);
+async function sendWelcome(ctx, userId) {
   if (userId) delete userSessions[userId];
 
   await ctx.reply(
     'Привет! Я бот логистического центра ГУП "Почта Таврии". Помогу  оформить заявку на грузоперевозку. Выберите, что нужно:',
     { attachments: [startKeyboard], format: 'markdown' }
   );
+}
+
+bot.command('start', async (ctx) => {
+  const { userId } = getUserData(ctx);
+  await sendWelcome(ctx, userId);
+});
+
+// Кнопка "Начать" в самом интерфейсе MAX (когда человек первый раз открывает
+// бота) — это ОТДЕЛЬНЫЙ тип апдейта bot_started, а не текстовая команда
+// /start. Раньше он вообще никак не обрабатывался, поэтому при нажатии
+// именно этой кнопки бот молчал — визуально выглядело как "не запускается".
+bot.on('bot_started', async (ctx) => {
+  const { userId } = getUserData(ctx);
+  await sendWelcome(ctx, userId);
 });
 
 // /orders — ТОЛЬКО в чате админов. Вместо того чтобы сразу вываливать все
@@ -1409,7 +1442,7 @@ bot.action('no_load_floor', async (ctx) => {
   session.data.floor = '—';
   session.data.floorItems = '—';
   session.step = 'WAIT_DETAILS';
-  await navigateTo(ctx, ORDER_DETAILS_PROMPT, backToMenuKeyboard);
+  await navigateTo(ctx, ORDER_DETAILS_PROMPT, skipDetailsKeyboard);
 });
 
 bot.action('intermediate_adress', async (ctx) => {
@@ -1475,6 +1508,15 @@ bot.action('consignee_no_consignor', async (ctx) => {
   );
 });
 
+bot.action('skip_details', async (ctx) => {
+  const { userId } = getUserData(ctx);
+  const session = await requireSession(ctx, userId);
+  if (!session) return;
+
+  session.data.details = '—';
+  await proceedAfterDetails(ctx, session);
+});
+
 bot.action('skip_photo', async (ctx) => {
   const { userId } = getUserData(ctx);
   const session = await requireSession(ctx, userId);
@@ -1522,17 +1564,93 @@ bot.action('my_orders', async (ctx) => {
   const { userId } = getUserData(ctx);
   const orders = getUserOrders(userId, 10);
 
+  // Убираем экран меню, из которого нажали "Мои заказы" — дальше идёт
+  // либо одно сообщение (если заявок нет), либо несколько (карточки).
+  try {
+    await ctx.deleteMessage();
+  } catch (e) {
+    // Игнорируем, если уже удалено
+  }
+
   if (orders.length === 0) {
-    await navigateTo(ctx, 'У вас пока нет отправленных заявок.', startKeyboard);
+    await ctx.reply('У вас пока нет отправленных заявок.', { attachments: [startKeyboard], format: 'markdown' });
     return;
   }
 
-  // Отменить или закрыть заявку самостоятельно нельзя — это делает
-  // только менеджер (см. /orders в чате админов), поэтому здесь просто
-  // список для справки, без кнопок под каждой заявкой.
-  const text = `📦 **Ваши последние заявки (${orders.length}):**\n\n${orders.map(buildOrderCardText).join('\n\n')}`;
+  const activeOrders = orders.filter((o) => o.status === 'active');
+  const pastOrders = orders.filter((o) => o.status !== 'active');
 
-  await navigateTo(ctx, text, startKeyboard);
+  // Активные — отдельной карточкой с кнопкой отмены на каждую, чтобы
+  // было сразу понятно, какую именно заявку отменяешь.
+  for (const order of activeOrders) {
+    await ctx.reply(
+      buildOrderCardText(order),
+      { attachments: [userOrderKeyboard(order.id)], format: 'markdown' }
+    );
+  }
+
+  // Прошлые (отменённые/закрытые) — одним компактным списком, без кнопок.
+  const historyText = pastOrders.length > 0
+    ? `📋 **Прошлые заявки (${pastOrders.length}):**\n\n${pastOrders.map(buildOrderCardText).join('\n\n')}`
+    : (activeOrders.length > 0 ? 'Прошлых заявок пока нет.' : 'У вас пока нет отправленных заявок.');
+
+  await ctx.reply(historyText, { attachments: [startKeyboard], format: 'markdown' });
+});
+
+// Пользователь отменяет СВОЮ заявку. Владельца проверяем по userId в
+// записи заказа — иначе кто угодно, подобрав id, мог бы отменить чужую.
+// Всё тело обёрнуто в try/catch с логом: если тут что-то падает молча,
+// пользователь раньше просто не получал вообще никакого ответа — теперь
+// в худшем случае увидит "Не получилось..." и мы увидим причину в логах.
+bot.action(/^user_cancel_/, async (ctx) => {
+  try {
+    const { userId } = getUserData(ctx);
+    if (!userId) return;
+
+    const rawData = ctx.callback?.payload || ctx.update?.callback?.payload || '';
+    const orderId = Number(String(rawData).replace('user_cancel_', ''));
+
+    if (!Number.isFinite(orderId)) {
+      console.error('user_cancel_: не удалось распознать id заказа из payload:', rawData);
+      await replyAndClear(ctx, 'Не получилось определить заявку. Откройте «Мои заказы» ещё раз.');
+      return;
+    }
+
+    const order = getOrderById(orderId);
+
+    if (!order || order.userId !== userId) {
+      await replyAndClear(ctx, 'Заявка не найдена.');
+      return;
+    }
+
+    if (order.status !== 'active') {
+      await replyAndClear(ctx, `Эта заявка уже не активна (текущий статус: ${ORDER_STATUS_LABELS[order.status] || order.status}).`);
+      return;
+    }
+
+    updateOrderStatus(orderId, 'cancelled');
+
+    // Сообщаем админам, что клиент сам отменил заявку — чтобы менеджер
+    // не тратил время на её обработку.
+    try {
+      await bot.api.sendMessageToChat(
+        ADMIN_CHAT_ID,
+        `🚫 Клиент отменил заявку №${orderId}.\nТелефон: ${order.data?.phone || '—'}`,
+        { format: 'markdown' }
+      );
+    } catch (err) {
+      console.error('Не удалось уведомить админов об отмене заявки клиентом:', err.message || err);
+    }
+
+    await replyAndClear(ctx, `Заявка №${orderId} отменена.`);
+  } catch (err) {
+    console.error('🔥 Ошибка при отмене заявки пользователем:', err);
+    try {
+      await ctx.reply('⚠️ Не получилось отменить заявку из-за временного сбоя. Попробуйте ещё раз через минуту.', { format: 'markdown' });
+    } catch (replyErr) {
+      console.error('🔥 Не удалось даже уведомить об ошибке отмены:', replyErr);
+    }
+  }
 });
 
 bot.action('show_contacts', async (ctx) => {
